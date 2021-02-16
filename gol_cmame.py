@@ -1,20 +1,20 @@
+import copy
+import pickle
+import time
+from pdb import set_trace as T
 
+import cma
+import cv2
 #import game_of_life
 #from game_of_life.envs.env import GoLImitator
 import gym
-import time
-import numpy as np
-import tqdm
-from ribs.archives import GridArchive
 import matplotlib.pyplot as plt
-#from ribs.emitters import ImprovementEmitter
-from ribs.emitters import OptimizingEmitter
-from torch.nn import Conv2d
+import numpy as np
 import torch
-from pdb import set_trace as T
-import pickle
+import tqdm
 from ribs.archives import GridArchive, SlidingBoundaryArchive
-import cv2
+from ribs.emitters import ImprovementEmitter, OptimizingEmitter
+from torch.nn import Conv2d
 
 
 class World:
@@ -35,12 +35,15 @@ class World:
             [-1, 0],           [1, 0], # sides
             [-1, -1], [0, -1], [1, -1] # below
         ]
+
         if state is not None:
-            self.state = state
+            self.state = copy.deepcopy(state)
+            for i in range(width):
+                for j in range(height):
+                    self.add_cell(i, j, self.state[0, i, j] == 1)
         else:
-            raise Exception
             self.state = np.zeros(shape=(1, width, height), dtype=np.uint8)
-        self.populate_cells()
+            self.populate_cells()
         self.prepopulate_neighbours()
 
     def seed(self, seed=None):
@@ -49,9 +52,11 @@ class World:
     def _tick(self):
         state_changed = False
         # First determine the action for all cells
+
         for row in self.cells:
             for cell in row:
                 alive_neighbours = self.alive_neighbours_around(cell)
+
                 if cell.alive is False and alive_neighbours == 3:
                     cell.next_state = 1
                     state_changed = True
@@ -60,11 +65,13 @@ class World:
                         state_changed = True
                     cell.next_state = 0
                     # FIXME: should be in env class
+
                     if self.env is not None and self.env.view_agent:
                         self.env.agent_builds[cell.x, cell.y] = 0
         self.state_changed = state_changed
 
         # Then execute the determined action for all cells
+
         for row in self.cells:
             for cell in row:
                 if cell.next_state == 1:
@@ -80,11 +87,13 @@ class World:
     # special string builders, and use whatever runs the fastest
     def render(self):
         rendering = ''
+
         for y in list(range(self.height)):
             for x in list(range(self.width)):
                 cell = self.cell_at(x, y)
                 rendering += cell.to_char()
             rendering += "\n"
+
         return rendering
 
         # The following works but performs no faster than above
@@ -96,7 +105,6 @@ class World:
         #     rendering.append("\n")
         # return ''.join(rendering)
 
-    # Python doesn't have a concept of public/private methods
 
     def populate_cells(self):
         for y in list(range(self.height)):
@@ -106,6 +114,7 @@ class World:
 
     def repopulate_cells(self):
         ''' When resetting the env.'''
+
         for y in list(range(self.height)):
             for x in list(range(self.width)):
                 alive = (np.random.randint(0, 100) <= self.prob_life)
@@ -118,33 +127,39 @@ class World:
 
     def add_cell(self, x, y, alive=False):
         cell = self.cell_at(x, y)
+
         if cell != None:
             self.state[0][x][y] = int(cell.alive)
             raise World.LocationOccupied
         cell = Cell(x, y, alive)
         self.cells[x, y] = cell
         self.state[0][x][y] = int(alive)
+
         return self.cell_at(x, y)
 
     def build_cell(self, x, y, alive=True):
         cell = Cell(x, y, alive)
         self.cells[x, y] = cell
         self.state[0][x][y] = int(alive)
+
         return self.cell_at(x, y)
 
     def cell_at(self, x, y):
         x = x % self.width
         y = y % self.width
+
         return self.cells[x][y]
 
     def neighbours_around(self, cell):
         if cell.neighbours is None:
             cell.neighbours = []
+
             for rel_x,rel_y in self.cached_directions:
                 neighbour = self.cell_at(
                     cell.x + rel_x,
                     cell.y + rel_y
                 )
+
                 if neighbour is not None:
                     cell.neighbours.append(neighbour)
 
@@ -158,9 +173,11 @@ class World:
         # return len(list(filter(filter_alive, neighbours)))
 
         alive_neighbours = 0
+
         for neighbour in self.neighbours_around(cell):
             if neighbour.alive:
                 alive_neighbours += 1
+
         return alive_neighbours
 
     def set_state(self, state):
@@ -193,7 +210,8 @@ class GoLImitator(gym.core.Env):
         screen_width = 8*self.map_width
         #FIXME: remove need for this
         self.view_agent = False
-        self.render_gui = True
+        self.render_gui = False
+
         if self.render_gui:
             cv2.namedWindow("Game of Life", cv2.WINDOW_NORMAL)
             cv2.resizeWindow("Game of Life", screen_width, screen_width)
@@ -205,7 +223,7 @@ class GoLImitator(gym.core.Env):
         self.max_step = 5 * self.n_forward_frames
         self.n_step = 0
         self.prob_life = np.random.randint(15, 85)
-        self.gol = World(self.map_width, self.map_width, prob_life=self.prob_life, env=self, state=state) 
+        self.gol = World(self.map_width, self.map_width, prob_life=self.prob_life, env=self, state=state)
         self.actions = self.gol.state
         obs = self.actions
 
@@ -216,6 +234,7 @@ class GoLImitator(gym.core.Env):
         self.actions = actions
         self.gol._tick()
         reward = 0
+
         if self.n_step != 0 and self.n_step % self.n_forward_frames == 0:
             loss = (abs(self.gol.state - actions.numpy())).sum()
             reward += -loss
@@ -260,13 +279,16 @@ class FlexArchive(GridArchive):
         obj = np.mean(score_hists)
         self._solutions[index][2] = obj
         self._objective_values[index] = obj
+
         while len(score_hists) > 500:
             score_hists.pop(0)
 
     def add(self, solution, objective_value, behavior_values):
         index = self._get_index(behavior_values)
+
         if index in self.score_hists:
             self.score_hists[index] = [objective_value]
+
         return super().add(solution, objective_value, behavior_values)
 
 
@@ -274,12 +296,13 @@ def init_weights(m):
     if type(m) == torch.nn.Linear:
         torch.nn.init.xavier_uniform(m.weight)
         m.bias.data.fill_(0.01)
+
     if type(m) == torch.nn.Conv2d:
-        torch.nn.init.orthogonal(m.weight)
+        torch.nn.init.orthogonal_(m.weight)
 
 class NNGoL(torch.nn.Module):
     def __init__(self):
-        self.m = 50
+        self.m = 1
         super().__init__()
         self.l1 = Conv2d(1, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
         self.l2 = Conv2d(2 * self.m, self.m, 1, 1, 0, bias=True)
@@ -287,19 +310,20 @@ class NNGoL(torch.nn.Module):
         self.layers = [self.l1, self.l2, self.l3]
         self.apply(init_weights)
 
-    def forward(self, x): 
+    def forward(self, x):
         x = self.l1(x)
         x = torch.nn.functional.relu(x)
         x = self.l2(x)
         x = torch.nn.functional.relu(x)
         x = self.l3(x)
-        x = torch.nn.functional.sigmoid(x)
+        x = torch.sigmoid(x)
 
         return x
 
 def set_weights(nn, weights):
     with torch.no_grad():
         n_el = 0
+
         for layer in nn.layers:
             l_weights = weights[n_el:n_el + layer.weight.numel()]
             n_el += layer.weight.numel()
@@ -313,8 +337,8 @@ def set_weights(nn, weights):
             layer.bias.requires_grad = False
 
     return nn
- 
-def simulate(env, nn, model, state, seed=None):
+
+def simulate(env, nn, model, seed=None, state=None):
     """Simulates the lunar lander model.
 
     Args:
@@ -329,31 +353,37 @@ def simulate(env, nn, model, state, seed=None):
         impact_y_vel (float): The y velocity of the lander when it touches the
             ground for the first time.
     """
+
     if seed is not None:
         env.seed(seed)
 
 #   action_dim = env.action_space.shape
 #   obs_dim = env.observation_space.shape
 #   model = model.reshape((action_dim, obs_dim))
-    
+
 
     total_reward = 0.0
     obs = env.reset(state=state)
     done = False
+    act_sums = []
 
     obs = torch.Tensor(obs).unsqueeze(0)
+
     while not done:
 #       action = model @ obs  # Linear policy.
         action = nn(torch.Tensor(obs))
+        act_sums.append(action.sum())
         obs, reward, done, info = env.step(action)
-        env.render()
+#       env.render()
         total_reward += reward
 
     # average loss per step per cell
     total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2)
-    return total_reward
+    bc = 100 * np.mean(act_sums) / (env.map_width**2)
 
-BC = 0
+    return total_reward, bc
+
+BC = 2
 
 def get_bcs(nn):
     if BC == 1:
@@ -374,8 +404,11 @@ def get_bcs(nn):
         mean = np.mean(means)
         #FIXME: why?
         std = np.nanmean(stds)
-    
+
         return mean, std
+
+    elif BC == 2:
+        raise Exception
 
 def set_nograd(nn):
     for param in nn.parameters():
@@ -383,13 +416,14 @@ def set_nograd(nn):
 
 def get_init_weights(nn):
     init_weights = []
-#   n_par = 0 
+#   n_par = 0
     for lyr in nn.layers:
 #       n_par += np.prod(lyr.weight.shape)
 #       n_par += np.prod(lyr.bias.shape)
         init_weights.append(lyr.weight.view(-1).numpy())
         init_weights.append(lyr.bias.view(-1).numpy())
     init_weights = np.hstack(init_weights)
+
     return init_weights
 
 
@@ -412,6 +446,12 @@ class EvolverCMAME():
                     [(-10, 10)],
                     )
 
+        elif BC == 2:
+            archive = FlexArchive(
+                    [200],
+                    [(0, 100)],
+                    )
+
         emitters = [
 #               ImprovementEmitter(
                 OptimizingEmitter(
@@ -419,7 +459,7 @@ class EvolverCMAME():
                     init_weights,
                     0.5,
                     batch_size=10,
-                    ) for _ in range(1)
+                    ) for _ in range(2)
                 ]
 
 #       env = gym.make("GoLImitator-v0")
@@ -451,7 +491,9 @@ class EvolverCMAME():
         archive = self.archive
         seed = self.seed
         start_time = time.time()
-        total_itrs = 500
+        total_itrs = 1000
+#       init_states = np.zeros((n_sims, 1, 16, 16))
+        init_states = np.random.randint(0, 2, (n_sims, 1, 16, 16))
 
         for itr in tqdm.tqdm(range(1, total_itrs + 1)):
             # Request models from the optimizer.
@@ -459,80 +501,99 @@ class EvolverCMAME():
 
             # Evaluate the models and record the objectives and BCs.
             objs, bcs = [], []
+
             for model in sols:
 
                 m_objs = []  #, m_bcs = [], []
+                m_bcs = []
 
                 init_nn = set_weights(init_nn, model)
-                for _ in range(n_sims):
-                    obj = simulate(self.env, init_nn, model, seed)
-                    m_objs.append(obj)
 
-                bc = get_bcs(init_nn)
+                for i in range(n_sims):
+                    obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
+                    m_objs.append(obj)
+                    m_bcs.append(bc)
+
                 obj = np.mean(m_objs)
+                bc = np.mean(m_bcs)
                 objs.append(obj)
                 bcs.append([bc])
 
 
-            if not archive.empty:
-                if self.eval_elites:
-                    # Re-evaluate elites in case we have made some change
-                    # prior to reloading which may affect fitness
-                    elites = [archive.get_random_elite() for _ in range(len(archive._solutions))]
-                else:
-                    elites = [archive.get_random_elite() for _ in range(10)]
-                for (model, score, behavior_values) in elites:
-                    init_nn = set_weights(init_nn, model)
-                    m_objs = []  #, m_bcs = [], []
-                    for _ in range(n_sims):
-                        obj = simulate(self.env, init_nn, model, seed)
-                        m_objs.append(obj)
-                    obj = np.mean(m_objs)
-                    if not self.eval_elites:
-                        # if re-evaluating elites, throw away old scores
-                        obj = (score + obj) / 2
-                    else:
-                        self.eval_elites = False
-                    archive.update_elite(behavior_values, obj)
-                        
-                   #    m_objs.append(obj)
-                   #bc_a = get_bcs(init_nn)
-                   #obj = np.mean(m_objs)
-                   #objs.append(obj)
-                   #bcs.append([bc_a])
+           #if not archive.empty:
+           #    if self.eval_elites:
+           #        # Re-evaluate elites in case we have made some change
+           #        # prior to reloading which may affect fitness
+           #        elites = [archive.get_random_elite() for _ in range(len(archive._solutions))]
+           #    else:
+           #        elites = [archive.get_random_elite() for _ in range(10)]
 
-                
-            df = archive.as_pandas(include_solutions=False)
-            max_score = df['objective'].max()
+           #    for (model, score, behavior_values) in elites:
+           #        init_nn = set_weights(init_nn, model)
+           #        m_objs = []  #, m_bcs = [], []
+           #        m_bcs = []
+
+           #        for i in range(n_sims):
+           #            obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
+           #            m_objs.append(obj)
+           #            m_bcs.append(bc)
+
+           #        obj = np.mean(m_objs)
+           #        behavior_values = np.mean(bc)
+
+           #        if not self.eval_elites:
+           #            # if re-evaluating elites, throw away old scores
+           #            obj = (score + obj) / 2
+           #        else:
+           #            self.eval_elites = False
+           #        archive.update_elite(behavior_values, obj)
+
+           #       #    m_objs.append(obj)
+           #       #bc_a = get_bcs(init_nn)
+           #       #obj = np.mean(m_objs)
+           #       #objs.append(obj)
+           #       #bcs.append([bc_a])
+
+
+           #df = archive.as_pandas(include_solutions=False)
+           #max_score = df['objective'].max()
 
 
 
-#           if max_score == 0:
-            if not archive.empty:
-                df = archive.as_pandas(include_solutions=True)
-#               print('found perfect individual')
-                idx = df['objective'].argmax()
-                best_ind = df.iloc[df['objective'].argmax()]
-                idxs = [int(best_ind['index_{}'.format(i)]) for i in range(2)]
-                behavior_values = [best_ind['behavior_{}'.format(i)] for i in range(2)]
-                model = archive._solutions[idxs[0], idxs[1]]
-                score = max_score
-                init_nn = set_weights(init_nn, model)
-                while score == max_score:
-                    m_objs = []
-                    for _ in range(n_sims):
-                        obj = simulate(self.env, init_nn, model, seed)
-                        m_objs.append(obj)
-                    score = (score + obj) / 2
-           #    T()
-                archive.update_elite(np.array(behavior_values), score)
+#          #if max_score == 0:
+           #if not archive.empty:
+           #    df = archive.as_pandas(include_solutions=True)
+#          #    print('found perfect individual')
+           #    idx = df['objective'].argmax()
+           #    best_ind = df.iloc[df['objective'].argmax()]
+           #    idxs = [int(best_ind['index_{}'.format(i)]) for i in range(2)]
+           #    behavior_values = [best_ind['behavior_{}'.format(i)] for i in range(2)]
+           #    model = archive._solutions[idxs[0], idxs[1]]
+           #    score = max_score
+           #    init_nn = set_weights(init_nn, model)
+
+           #    while score == max_score:
+           #        m_objs = []
+           #        m_bcs = []
+
+           #        for i in range(n_sims):
+           #            obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
+           #            m_objs.append(obj)
+           #            m_bcs.append(bc)
+
+           #        obj = np.mean(m_objs)
+           #        behavior_values = np.mean(m_bcs)
+           #        score = (score + obj) / 2
+           #    archive.update_elite(np.array(behavior_values), score)
 
             # Send the results back to the optimizer.
-            bcs = [bc[0] for bc in bcs]
+         #  bcs = [bc[0] for bc in bcs]
             optimizer.tell(objs, bcs)
 
+            df = archive.as_pandas(include_solutions=True)
 
             # Logging.
+
             if itr % 1 == 0:
                 elapsed_time = time.time() - start_time
                 print(f"> {itr} itrs completed after {elapsed_time:.2f} s")
@@ -556,7 +617,6 @@ class EvolverCMAME():
         plt.ylabel("Impact y-velocity")
         plt.xlabel("Impact x-position")
 
-import cma
 
 class EvolverCMAES:
     def __init__(self):
@@ -580,12 +640,14 @@ class EvolverCMAES:
         nn = self.nn
         es = self.es
         env = self.env
+
         while not self.es.stop():
             solutions = es.ask()
             objs = []
+
             for model in solutions:
                 set_weights(nn, model)
-                objs.append(-np.mean([simulate(env, nn, model, init_states[i]) for i in range(20)]))
+                objs.append(-np.mean([simulate(env, nn, model, state=init_states[i]) for i in range(20)]))
             es.tell(solutions, objs)
             es.logger.add()
             es.disp()
@@ -593,7 +655,7 @@ class EvolverCMAES:
         cma.plot()
 
 
-SAVE_PATH = 'gol_cmaes_evolver_0'
+SAVE_PATH = 'gol_cmame_evolver_1'
 
 if __name__ == '__main__':
     try:
@@ -602,6 +664,6 @@ if __name__ == '__main__':
         evolver.evolve(eval_elites=False)
     except FileNotFoundError as e:
         print(e)
-        evolver = EvolverCMAES()
+#       evolver = EvolverCMAES()
+        evolver = EvolverCMAME()
         evolver.evolve()
-
