@@ -1,4 +1,6 @@
+import argparse
 import copy
+from torch import Tensor, ByteTensor
 import pickle
 import time
 from pdb import set_trace as T
@@ -16,8 +18,12 @@ from ribs.archives import GridArchive, SlidingBoundaryArchive
 from ribs.emitters import ImprovementEmitter, OptimizingEmitter
 from torch.nn import Conv2d
 
-RENDER = False
-CUDA = True
+#INFER = False
+MAP_WIDTH = 128
+global TRAIN_RENDER
+TRAIN_RENDER = False
+#SAVE_PATH = 'gol_cmame_brute_multi_2'
+
 
 def init(module, weight_init, bias_init, gain=1):
     weight_init(module.weight.data)
@@ -59,6 +65,8 @@ class World(torch.nn.Module):
             conv_weights.cuda()
         conv_weights = conv_weights
         self.transition_rule.weight = torch.nn.Parameter(conv_weights, requires_grad=False)
+        self.channels = 1
+        self.get_neighbors = self.get_neighbors_map().to(device)
         self.to(device)
 
     def populate_cells(self, state):
@@ -98,8 +106,42 @@ class World(torch.nn.Module):
 #           self.state[0, 0, x, y] = 0
 
     def _tick(self):
+#       self.step()
         self.state = self.forward(self.state)
     #print(self.state[0][0])
+
+    def step(self):
+        state = self.state
+        # Get neighbor counts of cells
+        neighbors = self.get_neighbors(state)[0, ...]
+
+        # Alive cell with less than two neighbors should die
+        rule1 = (neighbors < 2).type(Tensor)
+        mask1 = (rule1 * state[0, ...]).type(ByteTensor)
+
+        # Alive cell with more than two neighbors should die
+        rule2 = (neighbors > 3).type(Tensor)
+        mask2 = (rule2 * state[0, ...]).type(ByteTensor)
+
+        # Dead cell with exactly three neighbors should spawn
+        rule3 = (neighbors == 3).type(Tensor)
+        mask3 = (rule3 * (1 - state[0, ...])).type(ByteTensor)
+
+        # Update state
+        state[0, mask1] = 0
+        state[0, mask2] = 0
+        state[0, mask3] = 1
+        return state
+
+    def get_neighbors_map(self):
+        channels = self.channels
+        neighbors_filter = Conv2d(channels, channels, 3, padding=1)
+        neighbors_filter.weight = torch.nn.Parameter(Tensor([[[[1, 1, 1],
+                                                      [1, 0, 1],
+                                                      [1, 1, 1]]]]),
+                                            requires_grad=False)
+        neighbors_filter.bias = torch.nn.Parameter(torch.Tensor(np.zeros(neighbors_filter.bias.shape)), requires_grad=False)
+        return neighbors_filter
 
     def forward(self, x):
         with torch.no_grad():
@@ -180,7 +222,7 @@ class GoLImitator(gym.core.Env):
             n_forward_frames = 1
             self.prob_life = None
         else:
-            self.map_width = 16
+            self.map_width = MAP_WIDTH
             self.prob_life = np.random.randint(0, 100)
         self.n_forward_frames = n_forward_frames
         self.max_step = 1 * self.n_forward_frames
@@ -215,12 +257,14 @@ class GoLImitator(gym.core.Env):
         self.actions = actions
         self.gol._tick()
         reward = 0
+        loss_hist = []
 
-        if self.n_step != 0 and self.n_step % self.n_forward_frames == 0:
+        if not INFER and self.n_step != 0 and self.n_step % self.n_forward_frames == 0:
             if self.train_brute:
                 loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu())).sum()
             else:
                 loss = (abs(self.gol.state - actions.numpy())).sum()
+            loss_hist.append(loss)
             reward += -loss
             obs = self.gol.state
         else:
@@ -232,7 +276,10 @@ class GoLImitator(gym.core.Env):
         return obs, reward, done, info
 
     def render(self, mode=None):
-        rend_idx = np.random.randint(self.gol.state.shape[0])
+        if INFER:
+            rend_idx = 0
+        else:
+            rend_idx = np.random.randint(self.gol.state.shape[0])
     #   rend_arr_1 = np.array(self.gol.state, dtype=np.uint8)
     #   rend_arr_1 = np.vstack((rend_arr_1 * 255, rend_arr_1 * 255, rend_arr_1 * 255))
     #   rend_arr_1 = rend_arr_1.transpose(1, 2, 0)
@@ -348,8 +395,8 @@ def simulate(env, nn, model, seed=None, state=None):
             ground for the first time.
     """
 
-    if seed is not None:
-        env.seed(seed)
+#   if seed is not None:
+#       env.seed(seed)
 
 #   action_dim = env.action_space.shape
 #   obs_dim = env.observation_space.shape
@@ -361,7 +408,7 @@ def simulate(env, nn, model, seed=None, state=None):
     if RENDER:
         env.render()
     done = False
-    act_sums = []
+    bcs = []
 
 #   obs = torch.Tensor(obs).unsqueeze(0)
 
@@ -369,7 +416,13 @@ def simulate(env, nn, model, seed=None, state=None):
 #       action = model @ obs  # Linear policy.
 #       action = nn(torch.Tensor(obs))
         action = nn(obs)
-        act_sums.append(action.sum())
+
+        # mean and stddev output activation over batch
+        mean_act = action.mean(axis=-1).mean(axis=-1)
+        bcs.append((mean_act.mean(), mean_act.std()))
+
+#       entropy = torch.distributions.Categorical(probs=action.view(action.shape[0], -1)).entropy().mean()
+#       bcs.append(entropy)
         obs, reward, done, info = env.step(action)
         if RENDER:
             env.render()
@@ -377,7 +430,9 @@ def simulate(env, nn, model, seed=None, state=None):
 
     # average loss per step per cell
     total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2 * state.shape[0])
-    bc = 100 * np.mean(act_sums) / (env.map_width**2)
+
+    # mean BCs over episode steps
+    bc = (np.mean(bcs[0]), np.mean(bcs[1]))
 
     return total_reward, bc
 
@@ -433,6 +488,7 @@ class EvolverCMAME():
         set_nograd(init_nn)
         init_weights = get_init_weights(init_nn)
 
+        env = GoLImitator(train_brute=True)
         if BC == 0:
             archive = GridArchive(
                     [10, 10],
@@ -446,13 +502,13 @@ class EvolverCMAME():
 
         elif BC == 2:
             archive = GridArchive(
-                    [200],
-                    [(0, 100)],
+                    [50, 50],
+                    [(0, 1), (0, 1)]#
                     )
 
         emitters = [
-#               ImprovementEmitter(
-                OptimizingEmitter(
+                ImprovementEmitter(
+#               OptimizingEmitter(
                     archive,
                     init_weights,
                     0.05,
@@ -461,7 +517,6 @@ class EvolverCMAME():
                 ]
 
 #       env = gym.make("GoLImitator-v0")
-        env = GoLImitator(train_brute=True)
         self.seed = 420
         action_dim = env.action_space.shape
         obs_dim = env.observation_space.shape
@@ -477,8 +532,31 @@ class EvolverCMAME():
 
     def restore(self):
 #       self.env = gym.make("GoLImitator-v0", n_forward_frames=self.n_forward_frames)
-        self.env = GoLImitator(n_forward_frames=self.n_forward_frames)
+        if INFER:
+            n_forward_frames = 100
+        else:
+            n_forward_frames = self.n_forward_frames
+        self.env = GoLImitator(n_forward_frames=n_forward_frames, train_brute=not INFER)
 #       env.n_forward_frames = self.n_forward_frames
+
+
+    def infer(self):
+        df = self.archive.as_pandas()
+        high_performing = df.sort_values("objective", ascending=False)
+        rows = high_performing
+        models = np.array(rows.loc[:, "solution_0":])
+#       models = self.optimizer.ask()
+        i = 0
+        while True:
+            model = self.archive.get_random_elite()[0]
+#           model = models[np.random.randint(len(models))]
+#           model = models[i]
+            init_nn = set_weights(self.init_nn, model)
+            init_states = (np.random.random(size=(1, 1, MAP_WIDTH, MAP_WIDTH)) < 0.2).astype(np.uint8)
+            _, _ = simulate(self.env, init_nn, model, self.seed, state=init_states)
+            i += 1
+            if i == len(models):
+                i = 0
 
 
     def evolve(self, eval_elites=False):
@@ -508,8 +586,9 @@ class EvolverCMAME():
 
             # Evaluate the models and record the objectives and BCs.
             objs, bcs = [], []
+            bcs = np.zeros((len(sols), 2))
 
-            for model in sols:
+            for (i, model) in enumerate(sols):
 
                 m_objs = []  #, m_bcs = [], []
                 m_bcs = []
@@ -519,82 +598,14 @@ class EvolverCMAME():
 #               for i in range(n_sims):
                 obj, bc = simulate(self.env, init_nn, model, seed, state=init_states)
                 m_objs.append(obj)
-                m_bcs.append(bc)
+                bcs[i, :] = bc
 
                 obj = np.mean(m_objs)
-                bc = np.mean(m_bcs)
+#               bc = np.mean(m_bcs)
                 objs.append(obj)
-                bcs.append([bc])
+#               bcs.append([bc])
 
-
-           #if not archive.empty:
-           #    if self.eval_elites:
-           #        # Re-evaluate elites in case we have made some change
-           #        # prior to reloading which may affect fitness
-           #        elites = [archive.get_random_elite() for _ in range(len(archive._solutions))]
-           #    else:
-           #        elites = [archive.get_random_elite() for _ in range(10)]
-
-           #    for (model, score, behavior_values) in elites:
-           #        init_nn = set_weights(init_nn, model)
-           #        m_objs = []  #, m_bcs = [], []
-           #        m_bcs = []
-
-           #        for i in range(n_sims):
-           #            obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
-           #            m_objs.append(obj)
-           #            m_bcs.append(bc)
-
-           #        obj = np.mean(m_objs)
-           #        behavior_values = np.mean(bc)
-
-           #        if not self.eval_elites:
-           #            # if re-evaluating elites, throw away old scores
-           #            obj = (score + obj) / 2
-           #        else:
-           #            self.eval_elites = False
-           #        archive.update_elite(behavior_values, obj)
-
-           #       #    m_objs.append(obj)
-           #       #bc_a = get_bcs(init_nn)
-           #       #obj = np.mean(m_objs)
-           #       #objs.append(obj)
-           #       #bcs.append([bc_a])
-
-
-           #df = archive.as_pandas(include_solutions=False)
-           #max_score = df['objective'].max()
-
-
-
-#          #if max_score == 0:
-           #if not archive.empty:
-           #    df = archive.as_pandas(include_solutions=True)
-#          #    print('found perfect individual')
-           #    idx = df['objective'].argmax()
-           #    best_ind = df.iloc[df['objective'].argmax()]
-           #    idxs = [int(best_ind['index_{}'.format(i)]) for i in range(2)]
-           #    behavior_values = [best_ind['behavior_{}'.format(i)] for i in range(2)]
-           #    model = archive._solutions[idxs[0], idxs[1]]
-           #    score = max_score
-           #    init_nn = set_weights(init_nn, model)
-
-           #    while score == max_score:
-           #        m_objs = []
-           #        m_bcs = []
-
-           #        for i in range(n_sims):
-           #            obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
-           #            m_objs.append(obj)
-           #            m_bcs.append(bc)
-
-           #        obj = np.mean(m_objs)
-           #        behavior_values = np.mean(m_bcs)
-           #        score = (score + obj) / 2
-           #    archive.update_elite(np.array(behavior_values), score)
-
-            # Send the results back to the optimizer.
-         #  bcs = [bc[0] for bc in bcs]
+#           print(np.min(bcs), np.max(bcs))
             optimizer.tell(objs, bcs)
 
             df = archive.as_pandas(include_solutions=True)
@@ -625,49 +636,67 @@ class EvolverCMAME():
         plt.xlabel("Impact x-position")
 
 
-class EvolverCMAES:
-    def __init__(self):
-        self.nn = nn = NNGoL()
-        set_nograd(nn)
-        init_weights = get_init_weights(nn)
-        self.es = cma.CMAEvolutionStrategy(init_weights, 1,
-                {
-                'verb_disp': 1,
-               #'verb_plot': 1,
-                }
-                )
-        self.env = GoLImitator()
 
-    def restore(self):
-        self.env = GoLImitator()
-
-    def evolve(self, eval_elite=False):
-        n_sims = 20
-        init_states = np.zeros((n_sims, 1, 16, 16))
-        nn = self.nn
-        es = self.es
-        env = self.env
-
-        while not self.es.stop():
-            solutions = es.ask()
-            objs = []
-
-            for model in solutions:
-                set_weights(nn, model)
-                objs.append(-np.mean([simulate(env, nn, model, state=init_states[i]) for i in range(20)]))
-            es.tell(solutions, objs)
-            es.logger.add()
-            es.disp()
-        es.result_pretty()
-        cma.plot()
-
-
-SAVE_PATH = 'gol_cmame_brute_multi_0'
 
 if __name__ == '__main__':
+    opts = argparse.ArgumentParser(description='Game of Life')
+    opts.add_argument(
+        '-s',
+        '--size',
+        help='Size of world grid',
+        default=700)
+    opts.add_argument(
+        '-p',
+        '--prob',
+        help='Probability of life in the initial seed',
+        default=.05)
+    opts.add_argument(
+        '-tr',
+        '--tick_ratio',
+        help='Ticks needed to update on time step in game',
+        default=1)
+    opts.add_argument(
+        '-re',
+        '--record_entropy',
+        help='Should record entropy of configurations',
+        default=True,
+    )
+    opts.add_argument(
+        '-i',
+        '--infer',
+        action='store_true',
+    )
+    opts.add_argument(
+        '-e',
+        '--exp_name',
+        default='scrizzatch'
+    )
+    opts.add_argument(
+        '--episode_steps',
+        default=100,
+    )
+    opts = opts.parse_args()
+    global INFER
+    global EVO_DIR
+    global render
+    global CUDA
+    global EPISODE_STEPS
+    EPISODE_STEPS = opts.episode_steps
+    INFER = opts.infer
+    SAVE_PATH = opts.exp_name
+    if INFER:
+        RENDER = True
+        CUDA = False
+    else:
+        RENDER = TRAIN_RENDER
+        CUDA = True
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         evolver = pickle.load(open(SAVE_PATH, 'rb'))
         evolver.restore()
+        if INFER:
+            evolver.env.n_forward_frames = int(opts.episode_steps)
+            evolver.infer()
         evolver.evolve(eval_elites=False)
     except FileNotFoundError as e:
         print(e)
