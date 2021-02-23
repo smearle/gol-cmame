@@ -16,192 +16,174 @@ from ribs.archives import GridArchive, SlidingBoundaryArchive
 from ribs.emitters import ImprovementEmitter, OptimizingEmitter
 from torch.nn import Conv2d
 
+RENDER = False
+CUDA = True
 
-class World:
-    ''' An implementation of Conway's Game of Life'''
-    class LocationOccupied(RuntimeError): pass
+def init(module, weight_init, bias_init, gain=1):
+    weight_init(module.weight.data)
+    #bias_init(module.bias.data)
+    return module
 
-    # Python doesn't have a concept of public/private variables
 
-    def __init__(self, width, height, prob_life=20, env=None, state=None):
-        self.env = env
-        self.width = width
-        self.height = height
-        self.prob_life = prob_life
-        self.tick = 0
-        self.cells = np.full(shape=(width, height), fill_value=None)
-        self.cached_directions = [
-            [-1, 1],  [0, 1],  [1, 1], # above
-            [-1, 0],           [1, 0], # sides
-            [-1, -1], [0, -1], [1, -1] # below
-        ]
+class World(torch.nn.Module):
+    def __init__(self,
+                 num_proc=1, state=None):
+        super(World, self).__init__()
+        self.cuda = CUDA
+#       self.map_width = map_width
+#       self.map_height = map_height
+#       self.prob_life = prob_life / 100
+#       self.num_proc = num_proc
+#       state_shape = (num_proc, 1, map_width, map_height)
+#       if self.cuda:
+#           self.y1 = torch.ones(state_shape).cuda()
+#           self.y0 = torch.zeros(state_shape).cuda()
+#       else:
+#           self.y1 = torch.ones(state_shape)
+#           self.y0 = torch.zeros(state_shape)
+        device = torch.device("cuda:0" if self.cuda else "cpu")
+        self.conv_init_ = lambda m: init(m,
+                                         torch.nn.init.dirac_, None,
+                                         #nn.init.calculate_gain('relu')
+                                         )
 
-        if state is not None:
-            self.state = copy.deepcopy(state)
-            for i in range(width):
-                for j in range(height):
-                    self.add_cell(i, j, self.state[0, i, j] == 1)
-        else:
-            self.state = np.zeros(shape=(1, width, height), dtype=np.uint8)
-            self.populate_cells()
-        self.prepopulate_neighbours()
+        conv_weights = [[[[1, 1, 1],
+                          [1, 9, 1],
+                          [1, 1, 1]]]]
+        self.transition_rule = Conv2d(1, 1, 3, 1, 1, bias=False, padding_mode='circular')
+        self.conv_init_(self.transition_rule)
+        self.transition_rule.to(device)
+        self.populate_cells(state=state)
+        conv_weights = torch.FloatTensor(conv_weights)
+        if self.cuda:
+            conv_weights.cuda()
+        conv_weights = conv_weights
+        self.transition_rule.weight = torch.nn.Parameter(conv_weights, requires_grad=False)
+        self.to(device)
+
+    def populate_cells(self, state):
+        if state is None:
+            return
+        self.state = torch.Tensor(state)
+        if self.cuda:
+            self.state.cuda()
+        return
+
+#       if self.cuda:
+#           self.state = torch.cuda.FloatTensor(size=
+#                                               (self.num_proc, 1, self.map_width, self.map_height)).uniform_(0, 1)
+#         # self.builds = torch.cuda.FloatTensor(size=
+#         #                                      (self.num_proc, 1, self.map_width, self.map_height)).fill_(0)
+#         # self.failed = torch.cuda.FloatTensor(size=
+#         #                                      (self.num_proc, 1, self.map_width, self.map_height)).fill_(0)
+#       else:
+#           self.state = torch.FloatTensor(size=
+#                                          (self.num_proc, 1, self.map_width, self.map_height)).uniform_(0, 1)
+#         # self.builds = torch.FloatTensor(size=
+#         #                                 (self.num_proc, 1, self.map_width, self.map_height)).fill_(0)
+#         # self.failed = torch.FloatTensor(size=
+#         #                                 (self.num_proc, 1, self.map_width, self.map_height)).fill_(0)
+#       self.state = torch.where(self.state < self.prob_life, self.y1, self.y0).float()
+
+    def repopulate_cells(self):
+        self.state.float().uniform_(0, 1)
+        self.state = torch.where(self.state < self.prob_life, self.y1, self.y0).float()
+#       self.builds.fill_(0)
+#       self.failed.fill_(0)
+
+#   def build_cell(self, x, y, alive=True):
+#       if alive:
+#           self.state[0, 0, x, y] = 1
+#       else:
+#           self.state[0, 0, x, y] = 0
+
+    def _tick(self):
+        self.state = self.forward(self.state)
+    #print(self.state[0][0])
+
+    def forward(self, x):
+        with torch.no_grad():
+            if self.cuda:
+                x = x.cuda()
+#           x = pad_circular(x, 1)
+            x = x.float()
+            #print(x[0])
+            x = self.transition_rule(x)
+            #print(x[0])
+            # Mysterious leakages appear here if we increase the batch size enough.
+            x = x.round() # so we hack them back into shape
+            #print(x[0])
+            x = self.GoLu(x)
+            return x
+
+    def GoLu(self, x):
+        '''
+        Applies the Game of Life Unit activation function, element-wise:
+                   _
+        __/\______/ \_____
+       0 2 4 6 8 0 2 4 6 8
+        '''
+        x_out = copy.deepcopy(x).fill_(0).float()
+        ded_0 = (x >= 2).float()
+        bth_0 = ded_0 * (x < 3).float()
+        x_out = x_out + (bth_0 * (x - 2).float())
+        ded_1 = (x >= 3).float()
+        bth_1 = ded_1 * (x < 4).float()
+        x_out = x_out + abs(bth_1 * (x - 4).float())
+        alv_0 = (x >= 10).float()
+        lif_0 = alv_0 * (x < 11).float()
+        x_out = x_out + (lif_0 * (x - 10).float())
+        alv_1 = (x >= 11).float()
+        lif_1 = alv_1 * (x < 12).float()
+        x_out = x_out + lif_1
+        alv_2 = (x >= 12).float()
+        lif_2 = alv_2 * (x < 13).float()
+        x_out = x_out + abs(lif_2 * (x -13).float())
+        assert (x_out >= 0).all() and (x_out <=1).all()
+        #x_out = torch.clamp(x_out, 0, 1)
+        return x_out
 
     def seed(self, seed=None):
         np.random.seed(seed)
 
-    def _tick(self):
-        state_changed = False
-        # First determine the action for all cells
+    def render(self, rend_idx):
+        rend_state = self.state[rend_idx].cpu()
+        rend_state = np.vstack((rend_state * 1, rend_state * 1, rend_state * 1))
+        rend_arr = rend_state
 
-        for row in self.cells:
-            for cell in row:
-                alive_neighbours = self.alive_neighbours_around(cell)
+        rend_arr = rend_arr.transpose(2, 1, 0)
+        rend_arr = rend_arr.astype(np.uint8)
+        rend_arr = rend_arr * 255
+        return rend_arr
+     #  cv2.imshow("Game of Life", rend_arr)
 
-                if cell.alive is False and alive_neighbours == 3:
-                    cell.next_state = 1
-                    state_changed = True
-                elif alive_neighbours < 2 or alive_neighbours > 3:
-                    if cell.alive:
-                        state_changed = True
-                    cell.next_state = 0
-                    # FIXME: should be in env class
+#       if self.record and not self.gif_writer.done:
+#           gif_dir = ('{}/gifs/'.format(self.record))
+#           im_dir = os.path.join(gif_dir, 'im')
+#           im_path = os.path.join(im_dir, 'e{:02d}_s{:04d}.png'.format(self.gif_ep_count, self.num_step))
+#           cv2.imwrite(im_path, rend_arr)
 
-                    if self.env is not None and self.env.view_agent:
-                        self.env.agent_builds[cell.x, cell.y] = 0
-        self.state_changed = state_changed
-
-        # Then execute the determined action for all cells
-
-        for row in self.cells:
-            for cell in row:
-                if cell.next_state == 1:
-                    cell.alive = True
-                elif cell.next_state == 0:
-                    cell.alive = False
-                x, y = cell.x, cell.y
-                self.state[0][x][y] = int(cell.alive)
-
-        self.tick += 1
-
-    # Implement first using string concatenation. Then implement any
-    # special string builders, and use whatever runs the fastest
-    def render(self):
-        rendering = ''
-
-        for y in list(range(self.height)):
-            for x in list(range(self.width)):
-                cell = self.cell_at(x, y)
-                rendering += cell.to_char()
-            rendering += "\n"
-
-        return rendering
-
-        # The following works but performs no faster than above
-        # rendering = []
-        # for y in list(range(self.height)):
-        #     for x in list(range(self.width)):
-        #         cell = self.cell_at(x, y)
-        #         rendering.append(cell.to_char())
-        #     rendering.append("\n")
-        # return ''.join(rendering)
+#           if self.gif_ep_count == 0 and self.num_step == self.max_step:
+#               self.gif_writer.create_gif(im_dir, gif_dir, 0, 0, 0)
+#               self.gif_ep_count = 0
+#       cv2.waitKey(1)
 
 
-    def populate_cells(self):
-        for y in list(range(self.height)):
-            for x in list(range(self.width)):
-                alive = (np.random.randint(0, 100) <= self.prob_life)
-                self.add_cell(x, y, alive)
 
-    def repopulate_cells(self):
-        ''' When resetting the env.'''
-
-        for y in list(range(self.height)):
-            for x in list(range(self.width)):
-                alive = (np.random.randint(0, 100) <= self.prob_life)
-                self.build_cell(x, y, alive)
-
-    def prepopulate_neighbours(self):
-        for row in self.cells:
-            for cell in row:
-                self.neighbours_around(cell)
-
-    def add_cell(self, x, y, alive=False):
-        cell = self.cell_at(x, y)
-
-        if cell != None:
-            self.state[0][x][y] = int(cell.alive)
-            raise World.LocationOccupied
-        cell = Cell(x, y, alive)
-        self.cells[x, y] = cell
-        self.state[0][x][y] = int(alive)
-
-        return self.cell_at(x, y)
-
-    def build_cell(self, x, y, alive=True):
-        cell = Cell(x, y, alive)
-        self.cells[x, y] = cell
-        self.state[0][x][y] = int(alive)
-
-        return self.cell_at(x, y)
-
-    def cell_at(self, x, y):
-        x = x % self.width
-        y = y % self.width
-
-        return self.cells[x][y]
-
-    def neighbours_around(self, cell):
-        if cell.neighbours is None:
-            cell.neighbours = []
-
-            for rel_x,rel_y in self.cached_directions:
-                neighbour = self.cell_at(
-                    cell.x + rel_x,
-                    cell.y + rel_y
-                )
-
-                if neighbour is not None:
-                    cell.neighbours.append(neighbour)
-
-        return cell.neighbours
-
-    # Implement first using filter/lambda if available. Then implement
-    # foreach and for. Retain whatever implementation runs the fastest
-    def alive_neighbours_around(self, cell):
-        # The following works but is slower
-        # filter_alive = lambda neighbour: neighbour.alive
-        # return len(list(filter(filter_alive, neighbours)))
-
-        alive_neighbours = 0
-
-        for neighbour in self.neighbours_around(cell):
-            if neighbour.alive:
-                alive_neighbours += 1
-
-        return alive_neighbours
-
-    def set_state(self, state):
-        pass
-
-class Cell:
-
-    def __init__(self, x, y, alive = False):
-        self.x = x
-        self.y = y
-        self.alive = alive
-        self.next_state = None
-        self.neighbours = None
-
-    def to_char(self):
-        return 'o' if self.alive else ' '
 
 class GoLImitator(gym.core.Env):
     ''' A gym environment in which the player is expected to learn the Game of Life. '''
-    def __init__(self, n_forward_frames=1):
-        self.map_width = 16
-        self.prob_life = np.random.randint(0, 100)
+    def __init__(self, n_forward_frames=1, train_brute=True):
+        if train_brute:
+            self.train_brute = True
+            self.map_width = 3
+            n_forward_frames = 1
+            self.prob_life = None
+        else:
+            self.map_width = 16
+            self.prob_life = np.random.randint(0, 100)
         self.n_forward_frames = n_forward_frames
-        self.max_step = 5 * self.n_forward_frames
+        self.max_step = 1 * self.n_forward_frames
         # how many frames do we let the NN predict on its own before allowing it to observe the actual game-state?
         # could increase this over the course of training to fine tune a model
         self.n_step = 0
@@ -210,7 +192,8 @@ class GoLImitator(gym.core.Env):
         screen_width = 8*self.map_width
         #FIXME: remove need for this
         self.view_agent = False
-        self.render_gui = False
+        self.render_gui = RENDER
+        self.gol = World()
 
         if self.render_gui:
             cv2.namedWindow("Game of Life", cv2.WINDOW_NORMAL)
@@ -220,10 +203,8 @@ class GoLImitator(gym.core.Env):
 
 
     def reset(self, state=None):
-        self.max_step = 5 * self.n_forward_frames
         self.n_step = 0
-        self.prob_life = np.random.randint(15, 85)
-        self.gol = World(self.map_width, self.map_width, prob_life=self.prob_life, env=self, state=state)
+        self.gol.populate_cells(state)
         self.actions = self.gol.state
         obs = self.actions
 
@@ -236,10 +217,12 @@ class GoLImitator(gym.core.Env):
         reward = 0
 
         if self.n_step != 0 and self.n_step % self.n_forward_frames == 0:
-            loss = (abs(self.gol.state - actions.numpy())).sum()
+            if self.train_brute:
+                loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu())).sum()
+            else:
+                loss = (abs(self.gol.state - actions.numpy())).sum()
             reward += -loss
             obs = self.gol.state
-            obs = torch.Tensor(obs).unsqueeze(0)
         else:
             obs = actions
         info = {}
@@ -249,11 +232,15 @@ class GoLImitator(gym.core.Env):
         return obs, reward, done, info
 
     def render(self, mode=None):
-        rend_arr_1 = np.array(self.gol.state, dtype=np.uint8)
-        rend_arr_1 = np.vstack((rend_arr_1 * 255, rend_arr_1 * 255, rend_arr_1 * 255))
-        rend_arr_1 = rend_arr_1.transpose(1, 2, 0)
+        rend_idx = np.random.randint(self.gol.state.shape[0])
+    #   rend_arr_1 = np.array(self.gol.state, dtype=np.uint8)
+    #   rend_arr_1 = np.vstack((rend_arr_1 * 255, rend_arr_1 * 255, rend_arr_1 * 255))
+    #   rend_arr_1 = rend_arr_1.transpose(1, 2, 0)
+        rend_arr_1 = self.gol.render(rend_idx=rend_idx)
         cv2.imshow("Game of Life", rend_arr_1)
-        actions = self.actions.squeeze(0)
+       #actions = self.actions.squeeze(0)
+        actions = self.actions
+        actions = actions[rend_idx]
         rend_arr_2 = np.array(actions, dtype=np.float)
         rend_arr_2 = np.vstack((rend_arr_2 , rend_arr_2 , rend_arr_2 ))
         rend_arr_2 = rend_arr_2.transpose(1, 2, 0)
@@ -262,34 +249,34 @@ class GoLImitator(gym.core.Env):
 
 
 
-class FlexArchive(GridArchive):
-    def __init__(self, *args, **kwargs):
-        self.score_hists = {}
-        super().__init__(*args, **kwargs)
-
-    def update_elite(self, behavior_values, obj):
-        index = self._get_index(behavior_values)
-        self.update_elite_idx(index, obj)
-
-    def update_elite_idx(self, index, obj):
-        if index not in self.score_hists:
-            self.score_hists[index] = []
-        score_hists = self.score_hists[index]
-        score_hists.append(obj)
-        obj = np.mean(score_hists)
-        self._solutions[index][2] = obj
-        self._objective_values[index] = obj
-
-        while len(score_hists) > 500:
-            score_hists.pop(0)
-
-    def add(self, solution, objective_value, behavior_values):
-        index = self._get_index(behavior_values)
-
-        if index in self.score_hists:
-            self.score_hists[index] = [objective_value]
-
-        return super().add(solution, objective_value, behavior_values)
+#class FlexArchive(GridArchive):
+#    def __init__(self, *args, **kwargs):
+#        self.score_hists = {}
+#        super().__init__(*args, **kwargs)
+#
+#    def update_elite(self, behavior_values, obj):
+#        index = self._get_index(behavior_values)
+#        self.update_elite_idx(index, obj)
+#
+#    def update_elite_idx(self, index, obj):
+#        if index not in self.score_hists:
+#            self.score_hists[index] = []
+#        score_hists = self.score_hists[index]
+#        score_hists.append(obj)
+#        obj = np.mean(score_hists)
+#        self._solutions[index][2] = obj
+#        self._objective_values[index] = obj
+#
+#        while len(score_hists) > 500:
+#            score_hists.pop(0)
+#
+#    def add(self, solution, objective_value, behavior_values):
+#        index = self._get_index(behavior_values)
+#
+#        if index in self.score_hists:
+#            self.score_hists[index] = [objective_value]
+#
+#        return super().add(solution, objective_value, behavior_values)
 
 
 def init_weights(m):
@@ -299,18 +286,25 @@ def init_weights(m):
 
     if type(m) == torch.nn.Conv2d:
         torch.nn.init.orthogonal_(m.weight)
+    if CUDA:
+        m.cuda()
+
 
 class NNGoL(torch.nn.Module):
     def __init__(self):
-        self.m = 1
+        self.m = 10
         super().__init__()
         self.l1 = Conv2d(1, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
         self.l2 = Conv2d(2 * self.m, self.m, 1, 1, 0, bias=True)
         self.l3 = Conv2d(self.m, 1, 1, 1, 0, bias=True)
         self.layers = [self.l1, self.l2, self.l3]
         self.apply(init_weights)
+        if CUDA:
+            self.cuda()
 
     def forward(self, x):
+        if CUDA:
+            x.cuda()
         x = self.l1(x)
         x = torch.nn.functional.relu(x)
         x = self.l2(x)
@@ -364,21 +358,25 @@ def simulate(env, nn, model, seed=None, state=None):
 
     total_reward = 0.0
     obs = env.reset(state=state)
+    if RENDER:
+        env.render()
     done = False
     act_sums = []
 
-    obs = torch.Tensor(obs).unsqueeze(0)
+#   obs = torch.Tensor(obs).unsqueeze(0)
 
     while not done:
 #       action = model @ obs  # Linear policy.
-        action = nn(torch.Tensor(obs))
+#       action = nn(torch.Tensor(obs))
+        action = nn(obs)
         act_sums.append(action.sum())
         obs, reward, done, info = env.step(action)
-#       env.render()
+        if RENDER:
+            env.render()
         total_reward += reward
 
     # average loss per step per cell
-    total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2)
+    total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2 * state.shape[0])
     bc = 100 * np.mean(act_sums) / (env.map_width**2)
 
     return total_reward, bc
@@ -420,8 +418,8 @@ def get_init_weights(nn):
     for lyr in nn.layers:
 #       n_par += np.prod(lyr.weight.shape)
 #       n_par += np.prod(lyr.bias.shape)
-        init_weights.append(lyr.weight.view(-1).numpy())
-        init_weights.append(lyr.bias.view(-1).numpy())
+        init_weights.append(lyr.weight.view(-1).cpu().numpy())
+        init_weights.append(lyr.bias.view(-1).cpu().numpy())
     init_weights = np.hstack(init_weights)
 
     return init_weights
@@ -436,18 +434,18 @@ class EvolverCMAME():
         init_weights = get_init_weights(init_nn)
 
         if BC == 0:
-            archive = FlexArchive(
+            archive = GridArchive(
                     [10, 10],
                     [(-5, 5), (0, 5)],
                     )
         elif BC == 1:
-            archive = FlexArchive(
+            archive = GridArchive(
                     [200],
                     [(-10, 10)],
                     )
 
         elif BC == 2:
-            archive = FlexArchive(
+            archive = GridArchive(
                     [200],
                     [(0, 100)],
                     )
@@ -457,13 +455,13 @@ class EvolverCMAME():
                 OptimizingEmitter(
                     archive,
                     init_weights,
-                    0.5,
-                    batch_size=10,
-                    ) for _ in range(2)
+                    0.05,
+                    batch_size=30,
+                    ) for _ in range(5)
                 ]
 
 #       env = gym.make("GoLImitator-v0")
-        env = GoLImitator()
+        env = GoLImitator(train_brute=True)
         self.seed = 420
         action_dim = env.action_space.shape
         obs_dim = env.observation_space.shape
@@ -484,7 +482,17 @@ class EvolverCMAME():
 
 
     def evolve(self, eval_elites=False):
-        n_sims = 50
+        init_states = np.zeros((2**9, 1, 3, 3))
+        s_idxs = np.arange(2**9)
+        for x in range(3):
+            for y in range(3):
+                s = np.where((s_idxs // (2**(x*3+y))) % 2 == 0)
+                init_states[s, 0, x, y] = 1 
+        for i, s in enumerate(init_states):
+            for j, t in enumerate(init_states):
+                if not i == j:
+                    assert (s != t).any()
+        n_sims = 2**9
         self.eval_elites = eval_elites
         init_nn = self.init_nn
         optimizer = self.optimizer
@@ -492,8 +500,7 @@ class EvolverCMAME():
         seed = self.seed
         start_time = time.time()
         total_itrs = 1000
-#       init_states = np.zeros((n_sims, 1, 16, 16))
-        init_states = np.random.randint(0, 2, (n_sims, 1, 16, 16))
+#       init_states = np.random.randint(0, 2, (n_sims, 1, 16, 16))
 
         for itr in tqdm.tqdm(range(1, total_itrs + 1)):
             # Request models from the optimizer.
@@ -509,10 +516,10 @@ class EvolverCMAME():
 
                 init_nn = set_weights(init_nn, model)
 
-                for i in range(n_sims):
-                    obj, bc = simulate(self.env, init_nn, model, seed, state=init_states[i])
-                    m_objs.append(obj)
-                    m_bcs.append(bc)
+#               for i in range(n_sims):
+                obj, bc = simulate(self.env, init_nn, model, seed, state=init_states)
+                m_objs.append(obj)
+                m_bcs.append(bc)
 
                 obj = np.mean(m_objs)
                 bc = np.mean(m_bcs)
@@ -655,7 +662,7 @@ class EvolverCMAES:
         cma.plot()
 
 
-SAVE_PATH = 'gol_cmame_evolver_1'
+SAVE_PATH = 'gol_cmame_brute_multi_0'
 
 if __name__ == '__main__':
     try:
