@@ -1,8 +1,11 @@
 import argparse
+import itertools
 import copy
+import utils
 from torch import Tensor, ByteTensor
 import pickle
 import time
+import os
 from pdb import set_trace as T
 
 import cma
@@ -14,9 +17,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import tqdm
-from ribs.archives import GridArchive, SlidingBoundaryArchive
+from ribs.archives import GridArchive#, SlidingBoundaryArchive
 from ribs.emitters import ImprovementEmitter, OptimizingEmitter
+from ribs.visualize import grid_archive_heatmap
 from torch.nn import Conv2d
+#from _multiprocessing import Pool
 
 #INFER = False
 MAP_WIDTH = 128
@@ -72,7 +77,7 @@ class World(torch.nn.Module):
     def populate_cells(self, state):
         if state is None:
             return
-        self.state = torch.Tensor(state)
+        self.state = torch.Tensor(state.astype(np.bool))
         if self.cuda:
             self.state.cuda()
         return
@@ -106,14 +111,17 @@ class World(torch.nn.Module):
 #           self.state[0, 0, x, y] = 0
 
     def _tick(self):
-#       self.step()
-        self.state = self.forward(self.state)
+        self.step()
+#       self.state = self.forward(self.state)
     #print(self.state[0][0])
 
     def step(self):
         state = self.state
-        # Get neighbor counts of cells
-        neighbors = self.get_neighbors(state)[0, ...]
+        if self.cuda:
+            neighbors = self.get_neighbors(state.cuda())[0, ...]
+        else:
+            # Get neighbor counts of cells
+            neighbors = self.get_neighbors(state)[0, ...]
 
         # Alive cell with less than two neighbors should die
         rule1 = (neighbors < 2).type(Tensor)
@@ -141,6 +149,8 @@ class World(torch.nn.Module):
                                                       [1, 1, 1]]]]),
                                             requires_grad=False)
         neighbors_filter.bias = torch.nn.Parameter(torch.Tensor(np.zeros(neighbors_filter.bias.shape)), requires_grad=False)
+        if CUDA:
+            neighbors_filter.cuda()
         return neighbors_filter
 
     def forward(self, x):
@@ -193,7 +203,7 @@ class World(torch.nn.Module):
         rend_state = np.vstack((rend_state * 1, rend_state * 1, rend_state * 1))
         rend_arr = rend_state
 
-        rend_arr = rend_arr.transpose(2, 1, 0)
+        rend_arr = rend_arr.transpose(1, 2, 0)
         rend_arr = rend_arr.astype(np.uint8)
         rend_arr = rend_arr * 255
         return rend_arr
@@ -215,15 +225,15 @@ class World(torch.nn.Module):
 
 class GoLImitator(gym.core.Env):
     ''' A gym environment in which the player is expected to learn the Game of Life. '''
-    def __init__(self, n_forward_frames=1, train_brute=True):
+    def __init__(self, n_forward_frames=1, train_brute=False):
+        self.train_brute = train_brute
         if train_brute:
-            self.train_brute = True
             self.map_width = 3
             n_forward_frames = 1
             self.prob_life = None
         else:
             self.map_width = MAP_WIDTH
-            self.prob_life = np.random.randint(0, 100)
+#           self.prob_life = np.random.randint(0, 100)
         self.n_forward_frames = n_forward_frames
         self.max_step = 1 * self.n_forward_frames
         # how many frames do we let the NN predict on its own before allowing it to observe the actual game-state?
@@ -256,19 +266,21 @@ class GoLImitator(gym.core.Env):
     def step(self, actions):
         self.actions = actions
         self.gol._tick()
+#       print(self.n_step)
         reward = 0
-        loss_hist = []
+#       loss_hist = []
 
-        if not INFER and self.n_step != 0 and self.n_step % self.n_forward_frames == 0:
-            if self.train_brute:
-                loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu())).sum()
-            else:
-                loss = (abs(self.gol.state - actions.numpy())).sum()
-            loss_hist.append(loss)
-            reward += -loss
-            obs = self.gol.state
-        else:
-            obs = actions
+      # if not INFER: # and self.n_step != 0:# and self.n_step % self.n_forward_frames == 0:
+          # if self.train_brute:
+          #    #loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu())).sum()
+          #     loss = (abs(self.gol.state[:, 0, :, :].cpu() - actions[:, 0, :, :].cpu())).sum()
+          # else:
+        loss = (abs(self.gol.state - actions.cpu().numpy())).sum()
+#       loss_hist.append(loss)
+        reward += -loss
+        obs = self.gol.state
+#       else:
+#           obs = actions
         info = {}
         done = self.n_step >= self.max_step
         self.n_step += 1
@@ -288,7 +300,7 @@ class GoLImitator(gym.core.Env):
        #actions = self.actions.squeeze(0)
         actions = self.actions
         actions = actions[rend_idx]
-        rend_arr_2 = np.array(actions, dtype=np.float)
+        rend_arr_2 = np.array(actions.cpu(), dtype=np.float)
         rend_arr_2 = np.vstack((rend_arr_2 , rend_arr_2 , rend_arr_2 ))
         rend_arr_2 = rend_arr_2.transpose(1, 2, 0)
         cv2.imshow("NN GoL", rend_arr_2)
@@ -335,27 +347,38 @@ def init_weights(m):
         torch.nn.init.orthogonal_(m.weight)
     if CUDA:
         m.cuda()
+        m.to('cuda:0')
 
 
 class NNGoL(torch.nn.Module):
     def __init__(self):
-        self.m = 10
+        self.m = 5
         super().__init__()
-        self.l1 = Conv2d(1, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
+        self.embed = Conv2d(1, 2, 1, 1, 0, bias=True)
+        self.embed.to('cuda:0')
+        self.l1 = Conv2d(2, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
         self.l2 = Conv2d(2 * self.m, self.m, 1, 1, 0, bias=True)
         self.l3 = Conv2d(self.m, 1, 1, 1, 0, bias=True)
-        self.layers = [self.l1, self.l2, self.l3]
+        self.layers = [self.embed, self.l1, self.l2, self.l3]
         self.apply(init_weights)
         if CUDA:
             self.cuda()
+            self.to('cuda:0')
 
     def forward(self, x):
         if CUDA:
-            x.cuda()
+            x = x.cuda()
+        self.embed.cuda()
+        x = self.embed(x)
+        x = torch.nn.functional.relu(x)
+        self.l1.cuda()
         x = self.l1(x)
         x = torch.nn.functional.relu(x)
+        self.l2.cuda()
         x = self.l2(x)
-        x = torch.nn.functional.relu(x)
+#       x = torch.nn.functional.relu(x)
+#       x = torch.nn
+        self.l3.cuda()
         x = self.l3(x)
         x = torch.sigmoid(x)
 
@@ -418,25 +441,44 @@ def simulate(env, nn, model, seed=None, state=None):
         action = nn(obs)
 
         # mean and stddev output activation over batch
-        mean_act = action.mean(axis=-1).mean(axis=-1)
-        bcs.append((mean_act.mean(), mean_act.std()))
+        if BC == 2:
+            mean_act = action.mean(axis=-1).mean(axis=-1).cpu().numpy()
 
-#       entropy = torch.distributions.Categorical(probs=action.view(action.shape[0], -1)).entropy().mean()
-#       bcs.append(entropy)
+            bcs.append((mean_act.mean(), mean_act.std()))
+        elif BC == 3:
+#           combinations = 2 ** (3 * 3)
+#           channels = 1
+#           structure_similarity = get_structure_similarity(combinations, channels)
+#           state = action
+#           entropy_1 = get_entropy(
+#               state, structure_similarity, combinations
+#           )
+
+#           print(action.shape)
+            entropy = torch.distributions.Categorical(probs=action.view(action.shape[0], -1)).entropy()
+#           print(entropy.shape)
+            entropy_1 = entropy.mean().cpu() * 100
+            entropy_2 = entropy.std().cpu() * 100
+#           print(entropy_1, entropy_2)
+            bcs.append((entropy_1, entropy_2))
+        else:
+            raise Exception
         obs, reward, done, info = env.step(action)
         if RENDER:
             env.render()
         total_reward += reward
 
+#   print(total_reward)
     # average loss per step per cell
-    total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2 * state.shape[0])
+#   total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2 * state.shape[0])
 
     # mean BCs over episode steps
     bc = (np.mean(bcs[0]), np.mean(bcs[1]))
+#   print(bc)
 
     return total_reward, bc
 
-BC = 2
+BC = 3
 
 def get_bcs(nn):
     if BC == 1:
@@ -460,7 +502,7 @@ def get_bcs(nn):
 
         return mean, std
 
-    elif BC == 2:
+    else:
         raise Exception
 
 def set_nograd(nn):
@@ -479,16 +521,55 @@ def get_init_weights(nn):
 
     return init_weights
 
+def get_neighbors_map(channels):
+    neighbors_filter = Conv2d(channels, channels, 3, padding=1)
+    neighbors_filter.weight = torch.nn.Parameter(Tensor([[[[1, 1, 1],
+                                                  [1, 0, 1],
+                                                  [1, 1, 1]]]]),
+                                        requires_grad=False)
+    neighbors_filter.bias = torch.nn.init.zeros_(neighbors_filter.bias)
+    return neighbors_filter
+
+def get_structure_similarity(combinations, channels):
+    tensors = torch.zeros([combinations, 1, 3, 3])
+    elems = list(map(Tensor, itertools.product([0, 1], repeat=9)))
+    for i, elem in enumerate(elems):
+        tensors[i] = elem.view(1, channels, 3, 3)
+    structure_similarity = Conv2d(
+        channels, combinations, 3, stride=3, groups=channels)
+    structure_similarity.weight = torch.nn.Parameter(tensors, requires_grad=False)
+    structure_similarity.bias = torch.nn.init.zeros_(structure_similarity.bias)
+    return structure_similarity
+
+def get_entropy(state, structure_similarity, combinations):
+    configs = structure_similarity(state)
+    match_weights = structure_similarity.weight.view(combinations, -1).sum(-1)
+    distribution = torch.zeros([combinations])
+
+    # Smooth distribution incase configuration doesn't exist
+    distribution.fill_(utils.EPSILON)
+    for i, weight in enumerate(match_weights):
+        config = configs[0][i]
+        mask = config == weight
+        distribution[i] += config[mask].shape[0]
+    distribution /= distribution.sum()
+
+    entropy = utils.entropy(distribution, 2)
+    info = "Max Event Probability: {} | Entropy: {}".format(
+        distribution.max(), entropy)
+#   print(info)
+    return entropy
+
 
 class EvolverCMAME():
     def __init__(self):
         self.epsilon = 1e-10
-        self.n_forward_frames = 1
+        self.n_forward_frames = 10
         init_nn = NNGoL()
         set_nograd(init_nn)
         init_weights = get_init_weights(init_nn)
 
-        env = GoLImitator(train_brute=True)
+        env = GoLImitator(train_brute=TRAIN_BRUTE)
         if BC == 0:
             archive = GridArchive(
                     [10, 10],
@@ -502,9 +583,17 @@ class EvolverCMAME():
 
         elif BC == 2:
             archive = GridArchive(
-                    [50, 50],
+#                   [50, 50],
+                    [50,50],
                     [(0, 1), (0, 1)]#
                     )
+
+        elif BC == 3:
+            archive = GridArchive(
+                [50, 50],
+   #            [(480, 490), (485, 486)]#
+                [(0, 150)] * 2,
+            )
 
         emitters = [
                 ImprovementEmitter(
@@ -533,15 +622,16 @@ class EvolverCMAME():
     def restore(self):
 #       self.env = gym.make("GoLImitator-v0", n_forward_frames=self.n_forward_frames)
         if INFER:
-            n_forward_frames = 100
+            n_forward_frames = EPISODE_STEPS
         else:
             n_forward_frames = self.n_forward_frames
-        self.env = GoLImitator(n_forward_frames=n_forward_frames, train_brute=not INFER)
+        self.env = GoLImitator(n_forward_frames=n_forward_frames, train_brute=TRAIN_BRUTE)
 #       env.n_forward_frames = self.n_forward_frames
 
 
     def infer(self):
         df = self.archive.as_pandas()
+#       high_performing = df[df["behavior_1"] > 0.1].sort_values("objective", ascending=False)
         high_performing = df.sort_values("objective", ascending=False)
         rows = high_performing
         models = np.array(rows.loc[:, "solution_0":])
@@ -560,25 +650,29 @@ class EvolverCMAME():
 
 
     def evolve(self, eval_elites=False):
-        init_states = np.zeros((2**9, 1, 3, 3))
-        s_idxs = np.arange(2**9)
-        for x in range(3):
-            for y in range(3):
-                s = np.where((s_idxs // (2**(x*3+y))) % 2 == 0)
-                init_states[s, 0, x, y] = 1 
-        for i, s in enumerate(init_states):
-            for j, t in enumerate(init_states):
-                if not i == j:
-                    assert (s != t).any()
-        n_sims = 2**9
+        if TRAIN_BRUTE:
+            init_states = np.zeros((2**9, 1, 3, 3))
+            s_idxs = np.arange(2**9)
+            for x in range(3):
+                for y in range(3):
+                    s = np.where((s_idxs // (2**(x*3+y))) % 2 == 0)
+                    init_states[s, 0, x, y] = 1
+            for i, s in enumerate(init_states):
+                for j, t in enumerate(init_states):
+                    if not i == j:
+                        assert (s != t).any()
+            n_sims = 2**9
+        else:
+            n_sims = 12
+            init_states = np.random.choice((0, 1), (n_sims, 1, MAP_WIDTH, MAP_WIDTH), p=(0.9, 0.1))
+
         self.eval_elites = eval_elites
         init_nn = self.init_nn
         optimizer = self.optimizer
         archive = self.archive
         seed = self.seed
         start_time = time.time()
-        total_itrs = 1000
-#       init_states = np.random.randint(0, 2, (n_sims, 1, 16, 16))
+        total_itrs = 10000
 
         for itr in tqdm.tqdm(range(1, total_itrs + 1)):
             # Request models from the optimizer.
@@ -588,6 +682,8 @@ class EvolverCMAME():
             objs, bcs = [], []
             bcs = np.zeros((len(sols), 2))
 
+#           pool_in = []
+
             for (i, model) in enumerate(sols):
 
                 m_objs = []  #, m_bcs = [], []
@@ -596,6 +692,7 @@ class EvolverCMAME():
                 init_nn = set_weights(init_nn, model)
 
 #               for i in range(n_sims):
+#               pool_in.append(self.env, init_nn, model, seed, )
                 obj, bc = simulate(self.env, init_nn, model, seed, state=init_states)
                 m_objs.append(obj)
                 bcs[i, :] = bc
@@ -606,6 +703,7 @@ class EvolverCMAME():
 #               bcs.append([bc])
 
 #           print(np.min(bcs), np.max(bcs))
+#           print(bcs)
             optimizer.tell(objs, bcs)
 
             df = archive.as_pandas(include_solutions=True)
@@ -627,14 +725,12 @@ class EvolverCMAME():
 #                   self.eval_elites = True
                 self.restore()
 
-        from ribs.visualize import grid_archive_heatmap
 
         plt.figure(figsize=(8, 6))
         grid_archive_heatmap(archive, vmin=-300, vmax=300)
         plt.gca().invert_yaxis()  # Makes more sense if larger velocities are on top.
         plt.ylabel("Impact y-velocity")
         plt.xlabel("Impact x-position")
-
 
 
 
@@ -681,20 +777,24 @@ if __name__ == '__main__':
     global render
     global CUDA
     global EPISODE_STEPS
-    EPISODE_STEPS = opts.episode_steps
+    global TRAIN_BRUTE
+    EPISODE_STEPS = int(opts.episode_steps)
     INFER = opts.infer
-    SAVE_PATH = opts.exp_name
+    SAVE_PATH = os.path.join('experiments', opts.exp_name)
     if INFER:
         RENDER = True
-        CUDA = False
+        CUDA = True
+        TRAIN_BRUTE = False
     else:
         RENDER = TRAIN_RENDER
         CUDA = True
+        TRAIN_BRUTE = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
         evolver = pickle.load(open(SAVE_PATH, 'rb'))
+        evolver.render_gui = RENDER
         evolver.restore()
-        if INFER:
+        if INFER:# and not TRAIN_BRUTE:
             evolver.env.n_forward_frames = int(opts.episode_steps)
             evolver.infer()
         evolver.evolve(eval_elites=False)
