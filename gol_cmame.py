@@ -275,7 +275,10 @@ class GoLImitator(gym.core.Env):
           #    #loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu())).sum()
           #     loss = (abs(self.gol.state[:, 0, :, :].cpu() - actions[:, 0, :, :].cpu())).sum()
           # else:
-        loss = (abs(self.gol.state - actions.cpu().numpy())).sum()
+        if not INFER and self.train_brute:
+            loss = (abs(self.gol.state[:, 0, 1, 1].cpu() - actions[:, 0, 1, 1].cpu().numpy())).sum()
+        else:
+            loss = (abs(self.gol.state - actions.cpu().numpy())).sum()
 #       loss_hist.append(loss)
         reward += -loss
         obs = self.gol.state
@@ -308,34 +311,6 @@ class GoLImitator(gym.core.Env):
 
 
 
-#class FlexArchive(GridArchive):
-#    def __init__(self, *args, **kwargs):
-#        self.score_hists = {}
-#        super().__init__(*args, **kwargs)
-#
-#    def update_elite(self, behavior_values, obj):
-#        index = self._get_index(behavior_values)
-#        self.update_elite_idx(index, obj)
-#
-#    def update_elite_idx(self, index, obj):
-#        if index not in self.score_hists:
-#            self.score_hists[index] = []
-#        score_hists = self.score_hists[index]
-#        score_hists.append(obj)
-#        obj = np.mean(score_hists)
-#        self._solutions[index][2] = obj
-#        self._objective_values[index] = obj
-#
-#        while len(score_hists) > 500:
-#            score_hists.pop(0)
-#
-#    def add(self, solution, objective_value, behavior_values):
-#        index = self._get_index(behavior_values)
-#
-#        if index in self.score_hists:
-#            self.score_hists[index] = [objective_value]
-#
-#        return super().add(solution, objective_value, behavior_values)
 
 
 def init_weights(m):
@@ -352,14 +327,14 @@ def init_weights(m):
 
 class NNGoL(torch.nn.Module):
     def __init__(self):
-        self.m = 5
+        self.m = 1
         super().__init__()
-        self.embed = Conv2d(1, 2, 1, 1, 0, bias=True)
-        self.embed.to('cuda:0')
-        self.l1 = Conv2d(2, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
+#       self.embed = Conv2d(1, 2, 1, 1, 0, bias=True)
+        self.l1 = Conv2d(1, 2 * self.m, 3, 1, 1, bias=True, padding_mode='circular')
         self.l2 = Conv2d(2 * self.m, self.m, 1, 1, 0, bias=True)
         self.l3 = Conv2d(self.m, 1, 1, 1, 0, bias=True)
-        self.layers = [self.embed, self.l1, self.l2, self.l3]
+#       self.layers = [self.embed, self.l1, self.l2, self.l3]
+        self.layers = [self.l1, self.l2, self.l3]
         self.apply(init_weights)
         if CUDA:
             self.cuda()
@@ -368,9 +343,11 @@ class NNGoL(torch.nn.Module):
     def forward(self, x):
         if CUDA:
             x = x.cuda()
-        self.embed.cuda()
-        x = self.embed(x)
-        x = torch.nn.functional.relu(x)
+#       self.embed.cuda()
+#       x = self.embed(x)
+#       x = torch.nn.functional.relu(x)
+#       x = x.repeat((1, 2, 1, 1))
+#       x[:, 0, :, :] = (x[:, 0, :, :] + 1) % 2
         self.l1.cuda()
         x = self.l1(x)
         x = torch.nn.functional.relu(x)
@@ -461,6 +438,8 @@ def simulate(env, nn, model, seed=None, state=None):
             entropy_2 = entropy.std().cpu() * 100
 #           print(entropy_1, entropy_2)
             bcs.append((entropy_1, entropy_2))
+        elif BC == 4:
+            bcs.append(0.5)
         else:
             raise Exception
         obs, reward, done, info = env.step(action)
@@ -473,12 +452,15 @@ def simulate(env, nn, model, seed=None, state=None):
 #   total_reward = total_reward / ((env.max_step / env.n_forward_frames) * env.map_width**2 * state.shape[0])
 
     # mean BCs over episode steps
-    bc = (np.mean(bcs[0]), np.mean(bcs[1]))
+    if BC == 4:
+        bc = np.mean(bcs)
+    else:
+        bc = (np.mean(bcs[0]), np.mean(bcs[1]))
 #   print(bc)
 
     return total_reward, bc
 
-BC = 3
+BC = 4
 
 def get_bcs(nn):
     if BC == 1:
@@ -581,6 +563,7 @@ class EvolverCMAME():
                     [(-10, 10)],
                     )
 
+        # mean/std of output
         elif BC == 2:
             archive = GridArchive(
 #                   [50, 50],
@@ -588,6 +571,7 @@ class EvolverCMAME():
                     [(0, 1), (0, 1)]#
                     )
 
+        # entropy of output
         elif BC == 3:
             archive = GridArchive(
                 [50, 50],
@@ -595,12 +579,19 @@ class EvolverCMAME():
                 [(0, 150)] * 2,
             )
 
+        # just CMAES
+        elif BC == 4:
+            archive = GridArchive(
+                [1],
+                [(0, 1)],
+            )
+
         emitters = [
                 ImprovementEmitter(
 #               OptimizingEmitter(
                     archive,
                     init_weights,
-                    0.05,
+                    0.01,
                     batch_size=30,
                     ) for _ in range(5)
                 ]
@@ -679,8 +670,11 @@ class EvolverCMAME():
             sols = optimizer.ask()
 
             # Evaluate the models and record the objectives and BCs.
-            objs, bcs = [], []
-            bcs = np.zeros((len(sols), 2))
+            objs = []
+            if BC == 4:
+                bcs = np.zeros((len(sols), 1))
+            else:
+                bcs = np.zeros((len(sols), 2))
 
 #           pool_in = []
 
@@ -695,7 +689,10 @@ class EvolverCMAME():
 #               pool_in.append(self.env, init_nn, model, seed, )
                 obj, bc = simulate(self.env, init_nn, model, seed, state=init_states)
                 m_objs.append(obj)
-                bcs[i, :] = bc
+                if BC == 4:
+                    bcs[i] = bc
+                else:
+                    bcs[i, :] = bc
 
                 obj = np.mean(m_objs)
 #               bc = np.mean(m_bcs)
@@ -703,7 +700,6 @@ class EvolverCMAME():
 #               bcs.append([bc])
 
 #           print(np.min(bcs), np.max(bcs))
-#           print(bcs)
             optimizer.tell(objs, bcs)
 
             df = archive.as_pandas(include_solutions=True)
@@ -800,6 +796,6 @@ if __name__ == '__main__':
         evolver.evolve(eval_elites=False)
     except FileNotFoundError as e:
         print(e)
-#       evolver = EvolverCMAES()
-        evolver = EvolverCMAME()
+        evolver = EvolverCMAES()
+#       evolver = EvolverCMAME()
         evolver.evolve()

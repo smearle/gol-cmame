@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 import matplotlib.pyplot as plt
+from ribs.archives import GridArchive#, SlidingBoundaryArchive
 
 EPSILON = np.finfo(float).eps
 
@@ -32,3 +33,34 @@ def plot_entropies(entropies):
     axes[1].set_title('d/dH(H)')
     fig.tight_layout()
     plt.show()
+
+
+
+class FlexArchive(GridArchive):
+    def __init__(self, *args, **kwargs):
+        self.score_hists = {}
+        super().__init__(*args, **kwargs)
+
+    def update_elite(self, behavior_values, obj):
+        index = self._get_index(behavior_values)
+        self.update_elite_idx(index, obj)
+
+    def update_elite_idx(self, index, obj):
+        if index not in self.score_hists:
+            self.score_hists[index] = []
+        score_hists = self.score_hists[index]
+        score_hists.append(obj)
+        obj = np.mean(score_hists)
+        self._solutions[index][2] = obj
+        self._objective_values[index] = obj
+
+        while len(score_hists) > 500:
+            score_hists.pop(0)
+
+    def add(self, solution, objective_value, behavior_values):
+        index = self._get_index(behavior_values)
+
+        if index in self.score_hists:
+            self.score_hists[index] = [objective_value]
+
+        return super().add(solution, objective_value, behavior_values)
