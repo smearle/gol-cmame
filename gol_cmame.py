@@ -460,7 +460,7 @@ def simulate(env, nn, model, seed=None, state=None):
 
     return total_reward, bc
 
-BC = 4
+BC = 2
 
 def get_bcs(nn):
     if BC == 1:
@@ -796,6 +796,6 @@ if __name__ == '__main__':
         evolver.evolve(eval_elites=False)
     except FileNotFoundError as e:
         print(e)
-        evolver = EvolverCMAES()
-#       evolver = EvolverCMAME()
+#       evolver = EvolverCMAES()
+        evolver = EvolverCMAME()
         evolver.evolve()

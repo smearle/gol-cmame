@@ -221,7 +221,7 @@ class EvolverCMAME():
         init_nn = NNParity()
         set_nograd(init_nn)
         init_nn.set_trg_weights()
-        init_nn.perturb_weights(2)
+        init_nn.perturb_weights(PERTURB)
         init_weights = get_init_weights(init_nn)
 
         env = Parity()
@@ -426,6 +426,10 @@ if __name__ == '__main__':
         '--n_inputs',
         default=16,
     )
+    opts.add_argument(
+        '--perturb',
+        default=0.1
+    )
     opts = opts.parse_args()
     global INFER
     global EVO_DIR
@@ -433,9 +437,10 @@ if __name__ == '__main__':
     global CUDA
     global N_INPUTS
     global TRAIN_BRUTE
+    PERTURB = float(opts.perturb)
     N_INPUTS = int(opts.n_inputs)
     INFER = opts.infer
-    SAVE_PATH = os.path.join('experiments', opts.exp_name)
+    SAVE_PATH = os.path.join('experiments', 'n_in_{}_perturb_{}_{}'.format(N_INPUTS, PERTURB, opts.exp_name))
     if INFER:
         RENDER = True
         CUDA = True
